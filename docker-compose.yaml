@@ -23,7 +23,15 @@ services:
       - zt_data:/var/lib/zerotier-one
       - ./bot_data:/app/data
       - ./logs:/app/logs
+    ports:
+      - "${TG_DASHBOARD_PORT:-80}:80"
+    networks:
+      - tg_bot_network
 
 volumes:
   zt_data:
+
+networks:
+  tg_bot_network:
+    driver: bridge
 
