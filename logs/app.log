@@ -675,3 +675,6 @@ aiogram.exceptions.TelegramBadRequest: Telegram server says - Bad Request: can't
 2026-01-22 21:15:24,612 INFO aiogram.dispatcher Start polling
 2026-01-22 21:15:24,619 INFO main dashboard_started port=80
 2026-01-22 21:15:24,898 INFO aiogram.dispatcher Run polling for bot @vpnmanager_mvp_bot id=8598682637 - 'VPN manager'
+2026-01-22 21:18:31,992 WARNING aiogram.dispatcher Received SIGTERM signal
+2026-01-22 21:18:31,998 INFO aiogram.dispatcher Polling stopped for bot @vpnmanager_mvp_bot id=8598682637 - 'VPN manager'
+2026-01-22 21:18:32,000 INFO aiogram.dispatcher Polling stopped
