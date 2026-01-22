@@ -7,6 +7,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .db import DB
+from .template import render_template_html, settings_from_json
 from .qr import make_qr_png
 from .settings import Settings
 from .validation import is_valid_node_id
@@ -54,6 +55,13 @@ async def create_dispatcher(s: Settings, db: DB) -> tuple[Bot, Dispatcher]:
 
     @dp.message(Command("start"))
     async def start(m: Message) -> None:
+        if m.from_user:
+            await db.upsert_user_profile(
+                tg_id=m.from_user.id,
+                username=m.from_user.username,
+                first_name=m.from_user.first_name,
+                last_name=m.from_user.last_name,
+            )
         await m.answer(_start_text(s), reply_markup=_howto_kb(s.instruction_article_url), disable_web_page_preview=True)
         try:
             png = make_qr_png(s.web_page_url_1)
@@ -68,6 +76,13 @@ async def create_dispatcher(s: Settings, db: DB) -> tuple[Bot, Dispatcher]:
 
     @dp.message(Command("approve"))
     async def approve(m: Message) -> None:
+        if m.from_user:
+            await db.upsert_user_profile(
+                tg_id=m.from_user.id,
+                username=m.from_user.username,
+                first_name=m.from_user.first_name,
+                last_name=m.from_user.last_name,
+            )
         parts = (m.text or "").strip().split(maxsplit=1)
         if len(parts) != 2:
             await m.answer("Формат: /approve <node_id>")
@@ -119,7 +134,26 @@ async def create_dispatcher(s: Settings, db: DB) -> tuple[Bot, Dispatcher]:
         await q.message.answer(f"Заявка {req_id}: {status}")
 
         if status == "approved":
-            await bot.send_message(chat_id=req.tg_id, text=f"Ваша заявка {req_id} подтверждена. node_id: {req.node_id}")
+            raw = await db.get_setting("approval_message")
+            st = settings_from_json(raw or "")
+            u = await db.get_user(req.tg_id)
+            client_name = ""
+            username = ""
+            if u:
+                parts = [p for p in [u.first_name, u.last_name] if p]
+                client_name = " ".join(parts)
+                username = u.username or ""
+            variables = {
+                "client_name": client_name,
+                "request_id": req_id,
+                "node_id": req.node_id,
+                "tg_id": req.tg_id,
+                "username": username,
+                "bot_username": s.bot_username,
+                "network_id": s.zt_network_id,
+            }
+            msg_html = render_template_html(st.template_html, variables=variables, fallbacks=st.fallbacks)
+            await bot.send_message(chat_id=req.tg_id, text=msg_html, parse_mode="HTML")
         else:
             await bot.send_message(chat_id=req.tg_id, text=f"Ваша заявка {req_id} отклонена. node_id: {req.node_id}")
         await q.answer("Готово")

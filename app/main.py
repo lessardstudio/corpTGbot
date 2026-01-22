@@ -30,10 +30,10 @@ async def main_async() -> None:
     await db.init()
 
     bot, dp = await create_dispatcher(s, db)
-    dashboard_app = create_dashboard_app(db, s.dashboard_password)
+    dashboard_app = create_dashboard_app(db, s.dashboard_password, bot, s.admin_chat_id, s.bot_username, s.zt_network_id)
 
     bot_task = asyncio.create_task(dp.start_polling(bot))
-    dash_task = asyncio.create_task(_run_dashboard(dashboard_app, s.dashboard_port))
+    dash_task = asyncio.create_task(_run_dashboard(dashboard_app, s.dashboard_listen_port))
 
     done, pending = await asyncio.wait({bot_task, dash_task}, return_when=asyncio.FIRST_EXCEPTION)
     for t in done:

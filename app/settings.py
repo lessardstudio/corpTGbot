@@ -11,7 +11,7 @@ class Settings:
         self.zt_network_id = os.getenv("ZT_NETWORK_ID", "").strip()
         self.web_page_url_1 = os.getenv("TG_WEB_PAGE_URL_1", "").strip()
         self.web_page_url_2 = os.getenv("TG_WEB_PAGE_URL_2", "").strip()
-        self.dashboard_port = int(os.getenv("TG_DASHBOARD_PORT", "8080").strip() or "8080")
+        self.dashboard_listen_port = int(os.getenv("TG_DASHBOARD_LISTEN_PORT", "8080").strip() or "8080")
         self.db_path = os.getenv("TG_DB_PATH", "/app/data/bot.db").strip()
         self.log_path = os.getenv("TG_LOG_PATH", "/app/logs/app.log").strip()
 
