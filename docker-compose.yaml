@@ -23,8 +23,6 @@ services:
       TG_INSTRUCTION_ARTICLE_URL: "${TG_INSTRUCTION_ARTICLE_URL}"
       TG_ADMIN_CHAT_ID: "${TG_ADMIN_CHAT_ID}"
       TG_BOT_USERNAME: "${TG_BOT_USERNAME:-}"
-    ports:
-      - "${TG_DASHBOARD_PORT:-8080}:${TG_DASHBOARD_LISTEN_PORT:-8080}"
     volumes:
       - zt_data:/var/lib/zerotier-one
       - ./bot_data:/app/data
