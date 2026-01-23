@@ -1,2 +1,4 @@
 .env
-logs/app.log
+logs/
+bot_data/
+*.pyc

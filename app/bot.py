@@ -87,11 +87,12 @@ async def create_dispatcher(s: Settings, db: DB) -> tuple[Bot, Dispatcher]:
         if len(parts) != 2:
             await m.answer("Формат: /approve <node_id>")
             return
-        node_id = parts[1].strip()
-        if not is_valid_node_id(node_id):
+        node_id_raw = parts[1].strip()
+        if not is_valid_node_id(node_id_raw):
             await m.answer("node_id должен быть 10-значным hex (пример: a1b2c3d4e5)")
             return
-        req_id = await db.create_request(m.from_user.id, node_id.lower())
+        node_id = node_id_raw.lower()
+        req_id = await db.create_request(m.from_user.id, node_id)
         log.info("request_created tg_id=%s node_id=%s request_id=%s", m.from_user.id, node_id, req_id)
         await m.answer(f"Заявка принята. ID: {req_id}. Ожидайте решения администратора.")
         admin_msg = "\n".join(
@@ -100,7 +101,43 @@ async def create_dispatcher(s: Settings, db: DB) -> tuple[Bot, Dispatcher]:
                 f"request_id: {req_id}",
                 f"tg_id: {m.from_user.id}",
                 f"username: @{m.from_user.username}" if m.from_user.username else "username: (none)",
-                f"node_id: {node_id.lower()}",
+                f"node_id: {node_id}",
+            ]
+        )
+        await bot.send_message(
+            chat_id=s.admin_chat_id,
+            text=admin_msg,
+            reply_markup=_admin_action_kb(req_id),
+            disable_web_page_preview=True,
+        )
+
+    @dp.message()
+    async def maybe_node_id(m: Message) -> None:
+        if not m.from_user:
+            return
+        text = (m.text or "").strip()
+        if not text or text.startswith("/"):
+            return
+        token = text.split(maxsplit=1)[0].strip()
+        if not is_valid_node_id(token):
+            return
+        await db.upsert_user_profile(
+            tg_id=m.from_user.id,
+            username=m.from_user.username,
+            first_name=m.from_user.first_name,
+            last_name=m.from_user.last_name,
+        )
+        node_id = token.lower()
+        req_id = await db.create_request(m.from_user.id, node_id)
+        log.info("request_created tg_id=%s node_id=%s request_id=%s via=text", m.from_user.id, node_id, req_id)
+        await m.answer(f"Заявка принята. ID: {req_id}. Ожидайте решения администратора.")
+        admin_msg = "\n".join(
+            [
+                "Новая заявка на одобрение",
+                f"request_id: {req_id}",
+                f"tg_id: {m.from_user.id}",
+                f"username: @{m.from_user.username}" if m.from_user.username else "username: (none)",
+                f"node_id: {node_id}",
             ]
         )
         await bot.send_message(
