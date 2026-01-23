@@ -18,3 +18,12 @@
 
 - `TG_ADMIN_SESSION_MAX_AGE_SECONDS` — максимальная длительность сессии.
 - `TG_ADMIN_SESSION_IDLE_SECONDS` — таймаут бездействия, после которого нужно войти заново.
+
+## Логирование ZTNet
+
+При наличии `ZT_NETWORK_ID` приложение периодически проверяет статус подключения ZeroTier внутри контейнера и пишет в stdout/file лог строки вида:
+
+- `zt_monitor_start network_id=...`
+- `zt_status network_id=... node_id=... status=OK msg=подключение установлено ips=...`
+
+При проблемах статус логируется на `WARNING`/`ERROR` (например, `ACCESS_DENIED`).

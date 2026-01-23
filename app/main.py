@@ -12,6 +12,7 @@ from .dashboard import create_dashboard_app
 from .db import DB
 from .logging_setup import setup_bootstrap_logging, setup_logging
 from .settings import get_settings
+from .zt_monitor import zt_monitor_loop
 
 
 log = logging.getLogger("main")
@@ -75,10 +76,12 @@ async def main_async() -> None:
 
         log.info("init_done ms=%d", int((time.perf_counter() - started) * 1000))
 
+        zt_task = asyncio.create_task(zt_monitor_loop(s.zt_network_id))
+
         bot_task = asyncio.create_task(dp.start_polling(bot))
         dash_task = asyncio.create_task(_run_dashboard(dashboard_app, s.dashboard_listen_port))
 
-        done, pending = await asyncio.wait({bot_task, dash_task}, return_when=asyncio.FIRST_EXCEPTION)
+        done, pending = await asyncio.wait({bot_task, dash_task, zt_task}, return_when=asyncio.FIRST_EXCEPTION)
         for t in done:
             exc = t.exception()
             if exc:
