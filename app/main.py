@@ -30,7 +30,16 @@ async def main_async() -> None:
     await db.init()
 
     bot, dp = await create_dispatcher(s, db)
-    dashboard_app = create_dashboard_app(db, s.dashboard_password, bot, s.admin_chat_id, s.bot_username, s.zt_network_id)
+    dashboard_app = create_dashboard_app(
+        db,
+        s.dashboard_password,
+        bot,
+        s.admin_chat_id,
+        s.bot_username,
+        s.zt_network_id,
+        s.admin_session_max_age_seconds,
+        s.admin_session_idle_seconds,
+    )
 
     bot_task = asyncio.create_task(dp.start_polling(bot))
     dash_task = asyncio.create_task(_run_dashboard(dashboard_app, s.dashboard_listen_port))

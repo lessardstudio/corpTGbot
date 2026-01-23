@@ -15,6 +15,9 @@ class Settings:
         self.db_path = os.getenv("TG_DB_PATH", "/app/data/bot.db").strip()
         self.log_path = os.getenv("TG_LOG_PATH", "/app/logs/app.log").strip()
 
+        self.admin_session_max_age_seconds = int(os.getenv("TG_ADMIN_SESSION_MAX_AGE_SECONDS", "3600").strip() or "3600")
+        self.admin_session_idle_seconds = int(os.getenv("TG_ADMIN_SESSION_IDLE_SECONDS", "900").strip() or "900")
+
 
 def get_settings() -> Settings:
     s = Settings()

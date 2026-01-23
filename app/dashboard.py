@@ -1,6 +1,8 @@
-import base64
 import json
 import logging
+import secrets
+import urllib.parse
+import datetime as dt
 from typing import Any
 
 from aiohttp import web
@@ -15,27 +17,40 @@ from .validation import allowed_template_vars, validate_template_vars
 log = logging.getLogger("dashboard")
 
 
-def _is_authorized(request: web.Request, password: str) -> bool:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Basic "):
-        return False
-    raw = auth[len("Basic ") :].strip()
-    try:
-        decoded = base64.b64decode(raw).decode("utf-8")
-    except Exception:
-        return False
-    if ":" not in decoded:
-        return False
-    username, pwd = decoded.split(":", 1)
-    return username == "admin" and pwd == password
+def _is_https(request: web.Request) -> bool:
+    if request.scheme == "https":
+        return True
+    xf = request.headers.get("X-Forwarded-Proto", "").lower().strip()
+    return xf == "https"
 
 
-def _unauthorized() -> web.Response:
-    return web.Response(
-        status=401,
-        headers={"WWW-Authenticate": 'Basic realm="tgbot"'},
-        text="Unauthorized",
-    )
+def _cookie_opts(request: web.Request) -> dict[str, Any]:
+    opts: dict[str, Any] = {"httponly": True, "samesite": "Strict", "path": "/"}
+    if _is_https(request):
+        opts["secure"] = True
+    return opts
+
+
+def _redirect_to_login(request: web.Request) -> web.Response:
+    nxt = request.path_qs
+    loc = "/admin/login?" + urllib.parse.urlencode({"next": nxt})
+    return web.HTTPFound(location=loc)
+
+
+def _clear_session_cookie(resp: web.StreamResponse, request: web.Request) -> None:
+    resp.del_cookie("tg_admin_session", path="/")
+
+
+def _now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _now_iso_utc() -> str:
+    return _now_utc().isoformat()
+
+
+def _parse_dt(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value)
 
 
 def _html_page(title: str, body: str) -> str:
@@ -48,10 +63,14 @@ def _html_page(title: str, body: str) -> str:
         "</head><body>"
         "<header>"
         "<strong>tgbot admin</strong>"
-        "<nav style='display:flex;gap:12px'>"
+        "<nav style='display:flex;gap:12px;align-items:center'>"
         "<a href='/admin'>Пользователи</a>"
         "<a href='/admin/requests'>Запросы</a>"
         "<a href='/admin/settings'>Настройки</a>"
+        "<a href='/admin/sessions'>Сессии</a>"
+        "<form method='post' action='/admin/logout' style='margin:0'>"
+        "<button class='btn' type='submit' style='padding:6px 10px'>Выход</button>"
+        "</form>"
         "</nav>"
         "</header>"
         "<main>"
@@ -62,15 +81,75 @@ def _html_page(title: str, body: str) -> str:
     )
 
 
-def create_dashboard_app(db: DB, password: str, bot: Bot, admin_chat_id: int, bot_username: str, network_id: str) -> web.Application:
+def create_dashboard_app(
+    db: DB,
+    password: str,
+    bot: Bot,
+    admin_chat_id: int,
+    bot_username: str,
+    network_id: str,
+    session_max_age_seconds: int,
+    session_idle_seconds: int,
+) -> web.Application:
     app = web.Application()
 
     async def _json(request: web.Request, payload: dict[str, Any], status: int = 200) -> web.Response:
         return web.Response(text=json.dumps(payload, ensure_ascii=False), status=status, content_type="application/json")
 
-    def _require_auth(request: web.Request) -> web.Response | None:
-        if not _is_authorized(request, password):
-            return _unauthorized()
+    async def _require_auth(request: web.Request, *, redirect: bool) -> web.Response | None:
+        token = request.cookies.get("tg_admin_session", "").strip()
+        if not token:
+            if redirect:
+                return _redirect_to_login(request)
+            return await _json(request, {"error": "unauthorized"}, status=401)
+        token_hash = db.hash_session_token(token)
+        row = await db.get_admin_session(token_hash)
+        if not row or row.get("revoked_at"):
+            if redirect:
+                resp = _redirect_to_login(request)
+                _clear_session_cookie(resp, request)
+                return resp
+            return await _json(request, {"error": "unauthorized"}, status=401)
+
+        now = _now_utc()
+        try:
+            created_at = _parse_dt(row["created_at"])
+            last_seen_at = _parse_dt(row["last_seen_at"])
+            expires_at = _parse_dt(row["expires_at"])
+        except Exception:
+            await db.revoke_admin_session(int(row["id"]), _now_iso_utc())
+            if redirect:
+                resp = _redirect_to_login(request)
+                _clear_session_cookie(resp, request)
+                return resp
+            return await _json(request, {"error": "unauthorized"}, status=401)
+
+        if now >= expires_at:
+            await db.revoke_admin_session(int(row["id"]), _now_iso_utc())
+            if redirect:
+                resp = _redirect_to_login(request)
+                _clear_session_cookie(resp, request)
+                return resp
+            return await _json(request, {"error": "session_expired"}, status=401)
+
+        if (now - last_seen_at).total_seconds() > max(int(session_idle_seconds), 1):
+            await db.revoke_admin_session(int(row["id"]), _now_iso_utc())
+            if redirect:
+                resp = _redirect_to_login(request)
+                _clear_session_cookie(resp, request)
+                return resp
+            return await _json(request, {"error": "session_idle_timeout"}, status=401)
+
+        if (now - created_at).total_seconds() > max(int(session_max_age_seconds), 60):
+            await db.revoke_admin_session(int(row["id"]), _now_iso_utc())
+            if redirect:
+                resp = _redirect_to_login(request)
+                _clear_session_cookie(resp, request)
+                return resp
+            return await _json(request, {"error": "session_max_age"}, status=401)
+
+        await db.touch_admin_session(int(row["id"]), _now_iso_utc())
+        request["admin_session_id"] = int(row["id"])
         return None
 
     async def _notify_user(tg_id: int, text: str) -> None:
@@ -79,9 +158,74 @@ def create_dashboard_app(db: DB, password: str, bot: Bot, admin_chat_id: int, bo
         except Exception:
             log.exception("dashboard_notify_failed tg_id=%s", tg_id)
 
+    def _login_page_html(error: str | None, next_path: str) -> str:
+        err = f"<div class='toast err' style='position:static;box-shadow:none'>\n{error}\n</div>" if error else ""
+        nxt = urllib.parse.quote(next_path or "/admin", safe="")
+        body = (
+            "<div class='card' style='max-width:420px;margin:48px auto'>"
+            "<h1 style='margin:0 0 12px 0'>Вход</h1>"
+            "<p class='muted' style='margin-top:0'>Для доступа к админ-панели введите пароль.</p>"
+            f"{err}"
+            "<form method='post' action='/admin/login' autocomplete='off'>"
+            f"<input type='hidden' name='next' value='{nxt}'/>"
+            "<div style='display:flex;flex-direction:column;gap:10px'>"
+            "<input name='password' type='password' placeholder='Пароль' style='padding:10px;border:1px solid #ddd;border-radius:10px' required />"
+            "<button class='btn primary' type='submit'>Войти</button>"
+            "</div>"
+            "</form>"
+            "</div>"
+        )
+        return (
+            "<!doctype html><html><head><meta charset='utf-8'/>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
+            "<title>Вход</title>"
+            "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#fafafa;color:#111}.card{background:#fff;border:1px solid #e6e6e6;border-radius:10px;padding:16px}.btn{border:1px solid #ddd;background:#fff;border-radius:8px;padding:10px 12px;cursor:pointer}.btn.primary{background:#111;color:#fff;border-color:#111}.muted{color:#666;font-size:13px}.toast{background:#111;color:#fff;border-radius:10px;padding:10px 12px;max-width:420px}.toast.err{background:#b00020}</style>"
+            "</head><body>"
+            f"{body}"
+            "</body></html>"
+        )
+
+    async def login_get(request: web.Request) -> web.Response:
+        next_path = request.query.get("next", "/admin")
+        return web.Response(text=_login_page_html(None, next_path), content_type="text/html")
+
+    async def login_post(request: web.Request) -> web.Response:
+        form = await request.post()
+        pwd = str(form.get("password") or "").strip()
+        next_raw = str(form.get("next") or "/admin")
+        try:
+            next_path = urllib.parse.unquote(next_raw)
+        except Exception:
+            next_path = "/admin"
+        if not next_path.startswith("/"):
+            next_path = "/admin"
+        if pwd != password:
+            return web.Response(text=_login_page_html("Неверный пароль", next_path), content_type="text/html", status=401)
+
+        token = secrets.token_urlsafe(32)
+        token_hash = db.hash_session_token(token)
+        now = _now_utc()
+        max_age = max(int(session_max_age_seconds), 60)
+        expires_at = (now + dt.timedelta(seconds=max_age)).isoformat()
+        ip = request.remote
+        ua = request.headers.get("User-Agent")
+        await db.create_admin_session(token_hash, now.isoformat(), expires_at, ip, ua)
+
+        resp = web.HTTPFound(location=next_path)
+        resp.set_cookie("tg_admin_session", token, max_age=max_age, **_cookie_opts(request))
+        return resp
+
+    async def logout_post(request: web.Request) -> web.Response:
+        token = request.cookies.get("tg_admin_session", "").strip()
+        if token:
+            await db.revoke_admin_session_by_hash(db.hash_session_token(token), _now_iso_utc())
+        resp = web.HTTPFound(location="/admin/login")
+        _clear_session_cookie(resp, request)
+        return resp
+
     async def users_page(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=True)
+        if auth_resp is not None:
             return auth_resp
         body = (
             "<div class='card'>"
@@ -126,7 +270,7 @@ def create_dashboard_app(db: DB, password: str, bot: Bot, admin_chat_id: int, bo
             "el.bulkDeactivateBtn.disabled=state.selected.size===0;"
             "const pageIds=new Set(state.items.map(i=>i.tg_id));let all=true;let any=false;for(const id of pageIds){if(state.selected.has(id)) any=true; else all=false;}el.selAll.checked=all && pageIds.size>0;el.selAll.indeterminate=!all && any;"
             "}"
-            "async function api(path,opt){const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));let j=null;const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')) j=await r.json(); if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status));} return j;}"
+            "async function api(path,opt){const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));if(r.status===401){window.location='/admin/login?next='+encodeURIComponent(window.location.pathname+window.location.search);throw new Error('unauthorized');}let j=null;const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')) j=await r.json(); if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status));} return j;}"
             "async function load(){setBusy(true,'Загрузка');try{const qp=new URLSearchParams({page:String(state.page),page_size:String(state.pageSize),sort:state.sort,order:state.order,q:state.q});const data=await api('/api/admin/users?'+qp.toString());state.items=data.items;state.total=data.total;render();}catch(e){toast(e.message,true);}finally{setBusy(false,'');}}"
             "function debounce(fn,ms){let t=null;return (...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}"
             "el.q.addEventListener('input',debounce(()=>{state.q=el.q.value.trim();state.page=1;load();},300));"
@@ -144,8 +288,8 @@ def create_dashboard_app(db: DB, password: str, bot: Bot, admin_chat_id: int, bo
         return web.Response(text=_html_page("Пользователи", body), content_type="text/html")
 
     async def requests_page(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=True)
+        if auth_resp is not None:
             return auth_resp
         body = (
             "<div class='card'>"
@@ -180,7 +324,7 @@ def create_dashboard_app(db: DB, password: str, bot: Bot, admin_chat_id: int, bo
             "function setBusy(b,msg){el.statusLine.innerHTML=b?`<span class='pill'><span class='spinner' style='margin-right:6px'></span>${msg}</span>`:'';}"
             "function esc(s){return (s??'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}"
             "function render(){el.tbody.innerHTML=state.items.map(r=>{const st=esc(r.status);const pill=st==='approved'?`<span class='pill ok'>approved</span>`:(st==='denied'?`<span class='pill bad'>denied</span>`:`<span class='pill'>pending</span>`);const btns=r.status==='pending'?(`<button class='btn primary' data-act='approve' data-id='${r.id}'>Approve</button> <button class='btn danger' data-act='cancel' data-id='${r.id}'>Cancel</button>`):'';return `<tr><td><code>${r.id}</code></td><td><code>${r.tg_id}</code></td><td><code>${esc(r.node_id)}</code></td><td>${pill}</td><td>${esc(r.created_at)}</td><td>${esc(r.decided_at||'')}</td><td>${esc(r.decided_by||'')}</td><td>${btns}</td></tr>`;}).join('');el.pageLine.textContent=`Страница ${state.page} · Всего: ${state.total}`;el.prevBtn.disabled=state.page<=1;el.nextBtn.disabled=(state.page*state.pageSize)>=state.total;}"
-            "async function api(path,opt){const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));let j=null;const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')) j=await r.json(); if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status));} return j;}"
+            "async function api(path,opt){const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));if(r.status===401){window.location='/admin/login?next='+encodeURIComponent(window.location.pathname+window.location.search);throw new Error('unauthorized');}let j=null;const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')) j=await r.json(); if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status));} return j;}"
             "async function load(){setBusy(true,'Загрузка');try{const qp=new URLSearchParams({page:String(state.page),page_size:String(state.pageSize),sort:state.sort,order:state.order,q:state.q,status:state.status});const data=await api('/api/admin/requests?'+qp.toString());state.items=data.items;state.total=data.total;render();}catch(e){toast(e.message,true);}finally{setBusy(false,'');}}"
             "function debounce(fn,ms){let t=null;return (...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}"
             "el.q.addEventListener('input',debounce(()=>{state.q=el.q.value.trim();state.page=1;load();},300));"
@@ -195,8 +339,8 @@ def create_dashboard_app(db: DB, password: str, bot: Bot, admin_chat_id: int, bo
         return web.Response(text=_html_page("Запросы", body), content_type="text/html")
 
     async def settings_page(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=True)
+        if auth_resp is not None:
             return auth_resp
         body = """
 <div class='card'>
@@ -300,6 +444,10 @@ function setBusy(b,msg){el.statusLine.innerHTML=b?`<span class='pill'><span clas
 
 async function api(path,opt){
   const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));
+  if(r.status===401){
+    window.location='/admin/login?next='+encodeURIComponent(window.location.pathname+window.location.search);
+    throw new Error('unauthorized');
+  }
   const ct=r.headers.get('content-type')||'';
   const j=ct.includes('application/json')?await r.json():null;
   if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status));}
@@ -537,9 +685,145 @@ load();
 """
         return web.Response(text=_html_page("Настройки", body), content_type="text/html")
 
+    async def sessions_page(request: web.Request) -> web.Response:
+        auth_resp = await _require_auth(request, redirect=True)
+        if auth_resp is not None:
+            return auth_resp
+        body = """
+<div class='card'>
+  <h1 style='margin:0 0 12px 0'>Сессии</h1>
+  <p class='muted' style='margin-top:0'>Список активных и завершённых сессий админ-панели. Можно завершить другие сессии или любую выбранную.</p>
+
+  <div class='toolbar'>
+    <button class='btn danger' id='revokeOthersBtn'>Завершить другие сессии</button>
+    <span class='muted' id='statusLine'></span>
+  </div>
+
+  <div class='table-wrap'>
+    <table style='min-width:0'>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Создана</th>
+          <th>Последняя активность</th>
+          <th>Истекает</th>
+          <th>IP</th>
+          <th>User-Agent</th>
+          <th>Статус</th>
+          <th style='width:220px'>Операции</th>
+        </tr>
+      </thead>
+      <tbody id='tbody'></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const el={
+  tbody:document.getElementById('tbody'),
+  statusLine:document.getElementById('statusLine'),
+  revokeOthersBtn:document.getElementById('revokeOthersBtn'),
+};
+let currentSessionId=null;
+
+function toast(msg,isErr){const w=document.getElementById('toastWrap');const d=document.createElement('div');d.className='toast'+(isErr?' err':'');d.textContent=msg;w.appendChild(d);setTimeout(()=>{d.remove();},4500);}
+function setBusy(b,msg){el.statusLine.innerHTML=b?`<span class='pill'><span class='spinner' style='margin-right:6px'></span>${msg}</span>`:'';}
+
+async function api(path,opt){
+  const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));
+  if(r.status===401){
+    window.location='/admin/login?next='+encodeURIComponent(window.location.pathname+window.location.search);
+    throw new Error('unauthorized');
+  }
+  const ct=r.headers.get('content-type')||'';
+  const j=ct.includes('application/json')?await r.json():null;
+  if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status));}
+  return j;
+}
+
+function esc(s){
+  return (s??'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function render(items){
+  el.tbody.innerHTML=(items||[]).map(x=>{
+    const isCurrent = currentSessionId===x.id;
+    const st = x.revoked_at ? 'revoked' : 'active';
+    const pill = x.revoked_at ? `<span class='pill bad'>${st}</span>` : `<span class='pill ok'>${st}${isCurrent?' (current)':''}</span>`;
+    const btnDisabled = x.revoked_at || isCurrent;
+    return `<tr>
+      <td><code>${x.id}</code></td>
+      <td>${esc(x.created_at)}</td>
+      <td>${esc(x.last_seen_at)}</td>
+      <td>${esc(x.expires_at)}</td>
+      <td>${esc(x.ip||'')}</td>
+      <td>${esc((x.user_agent||'').slice(0,120))}</td>
+      <td>${pill}</td>
+      <td>
+        <button class='btn danger' data-act='revoke' data-id='${x.id}' type='button' ${btnDisabled?'disabled':''}>Завершить</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function load(){
+  setBusy(true,'Загрузка');
+  try{
+    const data=await api('/api/admin/sessions');
+    currentSessionId=data.current_session_id;
+    render(data.items||[]);
+  }catch(e){
+    toast(e.message,true);
+  }finally{
+    setBusy(false,'');
+  }
+}
+
+async function revoke(id){
+  if(!confirm('Завершить сессию #'+id+'?')) return;
+  setBusy(true,'Завершение');
+  try{
+    await api('/api/admin/sessions/'+id+'/revoke',{method:'POST',body:JSON.stringify({})});
+    toast('Готово');
+    await load();
+  }catch(e){
+    toast(e.message,true);
+  }finally{
+    setBusy(false,'');
+  }
+}
+
+async function revokeOthers(){
+  if(!confirm('Завершить все другие сессии?')) return;
+  setBusy(true,'Завершение');
+  try{
+    const r=await api('/api/admin/sessions/revoke_others',{method:'POST',body:JSON.stringify({})});
+    toast('Завершено: '+r.revoked);
+    await load();
+  }catch(e){
+    toast(e.message,true);
+  }finally{
+    setBusy(false,'');
+  }
+}
+
+el.tbody.addEventListener('click',(e)=>{
+  const t=e.target;
+  if(!(t instanceof HTMLElement)) return;
+  if(t.dataset.act==='revoke'){
+    const id=parseInt(t.dataset.id||'0',10);
+    if(id) revoke(id);
+  }
+});
+el.revokeOthersBtn.addEventListener('click',revokeOthers);
+load();
+</script>
+"""
+        return web.Response(text=_html_page("Сессии", body), content_type="text/html")
+
     async def api_get_approval_message(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         raw = await db.get_setting("approval_message")
         s = settings_from_json(raw or "")
@@ -569,8 +853,8 @@ load();
         return t
 
     async def api_preview_approval_message(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         try:
             payload = await request.json()
@@ -591,8 +875,8 @@ load();
         return await _json(request, {"html": html})
 
     async def api_save_approval_message(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         try:
             payload = await request.json()
@@ -635,8 +919,8 @@ load();
         return await _json(request, {"template_html": _denormalize_template_output(s.template_html), "fallbacks": s.fallbacks, "history": history})
 
     async def api_get_history_item(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         hid = int(request.match_info.get("history_id", "0") or "0")
         item = await db.get_setting_history_value(hid)
@@ -649,8 +933,8 @@ load();
         return await _json(request, {"template_html": _denormalize_template_output(s.template_html), "fallbacks": s.fallbacks})
 
     async def api_restore_approval_message(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         try:
             payload = await request.json()
@@ -675,9 +959,36 @@ load();
         ]
         return await _json(request, {"template_html": _denormalize_template_output(s.template_html), "fallbacks": s.fallbacks, "history": history})
 
+    async def api_sessions(request: web.Request) -> web.Response:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
+            return auth_resp
+        items = await db.list_admin_sessions(limit=200)
+        return await _json(request, {"items": items, "current_session_id": int(request.get("admin_session_id") or 0)})
+
+    async def api_session_revoke(request: web.Request) -> web.Response:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
+            return auth_resp
+        sid = int(request.match_info.get("session_id", "0") or "0")
+        if sid <= 0:
+            return await _json(request, {"error": "bad session_id"}, status=400)
+        await db.revoke_admin_session(sid, _now_iso_utc())
+        return await _json(request, {"ok": True})
+
+    async def api_sessions_revoke_others(request: web.Request) -> web.Response:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
+            return auth_resp
+        current_id = int(request.get("admin_session_id") or 0)
+        if current_id <= 0:
+            return await _json(request, {"error": "unauthorized"}, status=401)
+        revoked = await db.revoke_other_admin_sessions(current_id, _now_iso_utc())
+        return await _json(request, {"revoked": revoked})
+
     async def user_profile_page(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=True)
+        if auth_resp is not None:
             return auth_resp
         tg_id = int(request.match_info.get("tg_id", "0") or "0")
         body = (
@@ -697,7 +1008,7 @@ load();
             "function toast(msg,isErr){const w=document.getElementById('toastWrap');const d=document.createElement('div');d.className='toast'+(isErr?' err':'');d.textContent=msg;w.appendChild(d);setTimeout(()=>{d.remove();},4000);}"
             "function setBusy(b,msg){el.statusLine.innerHTML=b?`<span class='pill'><span class='spinner' style='margin-right:6px'></span>${msg}</span>`:'';}"
             "function esc(s){return (s??'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}"
-            "async function api(path,opt){const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));let j=null;const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')) j=await r.json(); if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status));} return j;}"
+            "async function api(path,opt){const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));if(r.status===401){window.location='/admin/login?next='+encodeURIComponent(window.location.pathname+window.location.search);throw new Error('unauthorized');}let j=null;const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')) j=await r.json(); if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status));} return j;}"
             "async function load(){setBusy(true,'Загрузка'); try{const u=await api('/api/admin/users/'+tgId); el.profileBox.innerHTML=`<div><div><strong>${u.username?('@'+esc(u.username)):'(no username)'}</strong> <span class='muted'>${esc([u.first_name,u.last_name].filter(Boolean).join(' '))}</span></div><div class='muted'>Создан: ${esc(u.created_at)} · Обновлён: ${esc(u.updated_at)} · ${u.is_active?`<span class='pill ok'>active</span>`:`<span class='pill bad'>inactive</span>`}</div><div class='muted'>node_id: ${u.node_id?('<code>'+esc(u.node_id)+'</code>'):'(none)'}</div></div>`; el.deactivateBtn.disabled=!u.is_active; const qp=new URLSearchParams({page:'1',page_size:'100',sort:'id',order:'desc',tg_id:String(tgId)}); const rs=await api('/api/admin/requests?'+qp.toString()); el.tbody.innerHTML=rs.items.map(r=>`<tr><td><code>${r.id}</code></td><td><code>${esc(r.node_id)}</code></td><td>${esc(r.status)}</td><td>${esc(r.created_at)}</td><td>${esc(r.decided_at||'')}</td></tr>`).join(''); }catch(e){toast(e.message,true);} finally{setBusy(false,'');}}"
             "el.deactivateBtn.addEventListener('click',async()=>{if(!confirm('Деактивировать пользователя '+tgId+'?')) return; el.deactivateBtn.setAttribute('disabled','disabled'); setBusy(true,'Выполнение'); try{await api('/api/admin/users/'+tgId+'/deactivate',{method:'POST',body:JSON.stringify({})}); toast('Пользователь деактивирован'); await load();}catch(e){toast(e.message,true);} finally{setBusy(false,'');}});"
             "load();"
@@ -706,8 +1017,8 @@ load();
         return web.Response(text=_html_page("Профиль", body), content_type="text/html")
 
     async def api_users(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         q = (request.query.get("q") or "").strip() or None
         page = int(request.query.get("page", "1") or "1")
@@ -740,8 +1051,8 @@ load();
         )
 
     async def api_user_get(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         tg_id = int(request.match_info.get("tg_id", "0") or "0")
         u = await db.get_user(tg_id)
@@ -764,8 +1075,8 @@ load();
         )
 
     async def api_user_deactivate(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         tg_id = int(request.match_info.get("tg_id", "0") or "0")
         ok = await db.deactivate_user(tg_id)
@@ -775,8 +1086,8 @@ load();
         return await _json(request, {"ok": ok})
 
     async def api_users_bulk_deactivate(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         try:
             payload = await request.json()
@@ -795,8 +1106,8 @@ load();
         return await _json(request, {"ok": True, "updated": updated})
 
     async def api_users_export(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         q = (request.query.get("q") or "").strip() or None
         sort = (request.query.get("sort") or "updated_at").strip()
@@ -830,8 +1141,8 @@ load();
         return web.Response(text="\n".join(lines), content_type="text/csv")
 
     async def api_requests(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         q = (request.query.get("q") or "").strip() or None
         status = (request.query.get("status") or "").strip() or None
@@ -865,8 +1176,8 @@ load();
         )
 
     async def api_request_decide(request: web.Request) -> web.Response:
-        auth_resp = _require_auth(request)
-        if auth_resp:
+        auth_resp = await _require_auth(request, redirect=False)
+        if auth_resp is not None:
             return auth_resp
         request_id = int(request.match_info.get("request_id", "0") or "0")
         action = request.match_info.get("action", "")
@@ -903,10 +1214,15 @@ load();
             await _notify_user(req.tg_id, f"Ваша заявка {request_id} отклонена. node_id: {req.node_id}")
         return await _json(request, {"ok": True})
 
+    app.router.add_get("/admin/login", login_get)
+    app.router.add_post("/admin/login", login_post)
+    app.router.add_post("/admin/logout", logout_post)
+
     app.router.add_get("/admin", users_page)
     app.router.add_get("/admin/requests", requests_page)
     app.router.add_get("/admin/users/{tg_id}", user_profile_page)
     app.router.add_get("/admin/settings", settings_page)
+    app.router.add_get("/admin/sessions", sessions_page)
 
     app.router.add_get("/api/admin/users", api_users)
     app.router.add_get("/api/admin/users/{tg_id}", api_user_get)
@@ -916,6 +1232,10 @@ load();
 
     app.router.add_get("/api/admin/requests", api_requests)
     app.router.add_post("/api/admin/requests/{request_id}/{action}", api_request_decide)
+
+    app.router.add_get("/api/admin/sessions", api_sessions)
+    app.router.add_post("/api/admin/sessions/{session_id}/revoke", api_session_revoke)
+    app.router.add_post("/api/admin/sessions/revoke_others", api_sessions_revoke_others)
 
     app.router.add_get("/api/admin/settings/approval_message", api_get_approval_message)
     app.router.add_post("/api/admin/settings/approval_message/preview", api_preview_approval_message)

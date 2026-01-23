@@ -1,4 +1,5 @@
 import datetime as dt
+import hashlib
 from dataclasses import dataclass
 
 from typing import Any
@@ -99,6 +100,24 @@ class DB:
             )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_settings_history_key ON settings_history(key);")
 
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_sessions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  token_hash TEXT NOT NULL UNIQUE,
+                  created_at TEXT NOT NULL,
+                  last_seen_at TEXT NOT NULL,
+                  expires_at TEXT NOT NULL,
+                  ip TEXT,
+                  user_agent TEXT,
+                  revoked_at TEXT
+                );
+                """
+            )
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_admin_sessions_token_hash ON admin_sessions(token_hash);")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_admin_sessions_revoked_at ON admin_sessions(revoked_at);")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at);")
+
             users_cols = await self._table_cols(db, "users")
             if users_cols and "created_at" not in users_cols:
                 await self._migrate_users_v1_to_v2(db)
@@ -157,6 +176,88 @@ class DB:
             if not row:
                 return None
             return str(row[0]), str(row[1])
+
+    def hash_session_token(self, token: str) -> str:
+        return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+    async def create_admin_session(self, token_hash: str, created_at: str, expires_at: str, ip: str | None, user_agent: str | None) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "INSERT INTO admin_sessions(token_hash, created_at, last_seen_at, expires_at, ip, user_agent) VALUES(?, ?, ?, ?, ?, ?)",
+                (token_hash, created_at, created_at, expires_at, ip, user_agent),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def get_admin_session(self, token_hash: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT id, token_hash, created_at, last_seen_at, expires_at, ip, user_agent, revoked_at FROM admin_sessions WHERE token_hash = ?",
+                (token_hash,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": int(row[0]),
+                "token_hash": str(row[1]),
+                "created_at": str(row[2]),
+                "last_seen_at": str(row[3]),
+                "expires_at": str(row[4]),
+                "ip": str(row[5]) if row[5] is not None else None,
+                "user_agent": str(row[6]) if row[6] is not None else None,
+                "revoked_at": str(row[7]) if row[7] is not None else None,
+            }
+
+    async def touch_admin_session(self, session_id: int, last_seen_at: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE admin_sessions SET last_seen_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (last_seen_at, session_id),
+            )
+            await db.commit()
+
+    async def revoke_admin_session(self, session_id: int, revoked_at: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE admin_sessions SET revoked_at = ? WHERE id = ?", (revoked_at, session_id))
+            await db.commit()
+
+    async def revoke_admin_session_by_hash(self, token_hash: str, revoked_at: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE admin_sessions SET revoked_at = ? WHERE token_hash = ?", (revoked_at, token_hash))
+            await db.commit()
+
+    async def list_admin_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
+        limit = min(max(int(limit), 1), 500)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT id, created_at, last_seen_at, expires_at, ip, user_agent, revoked_at FROM admin_sessions ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cur.fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": int(r[0]),
+                        "created_at": str(r[1]),
+                        "last_seen_at": str(r[2]),
+                        "expires_at": str(r[3]),
+                        "ip": str(r[4]) if r[4] is not None else None,
+                        "user_agent": str(r[5]) if r[5] is not None else None,
+                        "revoked_at": str(r[6]) if r[6] is not None else None,
+                    }
+                )
+            return out
+
+    async def revoke_other_admin_sessions(self, current_session_id: int, revoked_at: str) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "UPDATE admin_sessions SET revoked_at = ? WHERE id != ? AND revoked_at IS NULL",
+                (revoked_at, current_session_id),
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
 
     async def _table_cols(self, db: aiosqlite.Connection, table: str) -> set[str]:
         cur = await db.execute(f"PRAGMA table_info({table})")
