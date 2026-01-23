@@ -18,20 +18,13 @@ services:
       TG_INSTRUCTION_ARTICLE_URL: "${TG_INSTRUCTION_ARTICLE_URL}"
       TG_ADMIN_CHAT_ID: "${TG_ADMIN_CHAT_ID}"
       TG_BOT_USERNAME: "${TG_BOT_USERNAME:-}"
-      TG_DASHBOARD_LISTEN_PORT: "${TG_DASHBOARD_LISTEN_PORT:-80}"
     volumes:
       - zt_data:/var/lib/zerotier-one
       - ./bot_data:/app/data
       - ./logs:/app/logs
-    ports:
-      - "${TG_DASHBOARD_PORT:-80}:80"
-    networks:
-      - tg_bot_network
+
 
 volumes:
   zt_data:
 
-networks:
-  tg_bot_network:
-    driver: bridge
 
