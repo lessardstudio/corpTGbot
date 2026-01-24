@@ -18,14 +18,19 @@ from .zt_monitor import zt_monitor_loop
 log = logging.getLogger("main")
 
 
-async def _run_dashboard(app: web.Application, port: int) -> None:
+async def _run_dashboard(app: web.Application, port: int, use_ssl: bool = False, cert_path: str = None, key_path: str = None) -> None:
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    
+    ssl_context = None
+    if use_ssl and cert_path and key_path:
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.load_cert_chain(cert_path, key_path)
+    
+    site = web.TCPSite(runner, host="0.0.0.0", port=port, ssl_context=ssl_context)
     await site.start()
-    log.info("dashboard_started port=%s", port)
+    log.info("dashboard_started port=%s ssl=%s", port, bool(ssl_context))
     await asyncio.Event().wait()
-
 
 async def main_async() -> None:
     run_id = uuid.uuid4().hex
@@ -79,7 +84,13 @@ async def main_async() -> None:
         zt_task = asyncio.create_task(zt_monitor_loop(s.zt_network_id))
 
         bot_task = asyncio.create_task(dp.start_polling(bot))
-        dash_task = asyncio.create_task(_run_dashboard(dashboard_app, s.dashboard_listen_port))
+        dash_task = asyncio.create_task(_run_dashboard(
+            dashboard_app, 
+            s.dashboard_listen_port,
+            use_ssl=True,  # или False для HTTP
+            cert_path="/path/to/cert.pem",
+            key_path="/path/to/key.pem"
+        ))
 
         done, pending = await asyncio.wait({bot_task, dash_task, zt_task}, return_when=asyncio.FIRST_EXCEPTION)
         for t in done:

@@ -25,7 +25,15 @@ COPY app /app/app
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
-EXPOSE 8080
+RUN mkdir -p /app/certs && \
+    openssl req -x509 -newkey rsa:4096 -nodes \
+    -out /app/certs/cert.pem \
+    -keyout /app/certs/key.pem \
+    -days 365 \
+    -subj "/C=RU/ST=Moscow/L=Moscow/O=CorpVPN/CN=10.121.15.102" \
+    -addext "subjectAltName=IP:10.121.15.102,DNS:tgadmin.corp.clan"
+
+EXPOSE 8080 443
 
 CMD ["/app/start.sh"]
 
