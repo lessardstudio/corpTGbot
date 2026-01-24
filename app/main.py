@@ -88,8 +88,8 @@ async def main_async() -> None:
             dashboard_app, 
             s.dashboard_listen_port,
             use_ssl=True,  # или False для HTTP
-            cert_path="/path/to/cert.pem",
-            key_path="/path/to/key.pem"
+            cert_path="/app/certs/cert.pem",
+            key_path="/app/certs/key.pem"
         ))
 
         done, pending = await asyncio.wait({bot_task, dash_task, zt_task}, return_when=asyncio.FIRST_EXCEPTION)
