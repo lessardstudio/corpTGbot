@@ -88,7 +88,7 @@ async def main_async() -> None:
         dash_task = asyncio.create_task(_run_dashboard(
             dashboard_app, 
             s.dashboard_listen_port,
-            use_ssl=True,  # или False для HTTP
+            use_ssl=False,  # или False для HTTP
             cert_path="/app/certs/cert.pem",
             key_path="/app/certs/key.pem"
         ))
